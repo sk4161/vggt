@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
@@ -26,7 +28,12 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1") if enable_depth else None
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_track else None
 
-    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
+    def forward(
+        self,
+        images: torch.Tensor,
+        query_points: torch.Tensor = None,
+        attention_masks: Optional[torch.Tensor] = None,
+    ):
         """
         Forward pass of the VGGT model.
 
@@ -36,6 +43,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             query_points (torch.Tensor, optional): Query points for tracking, in pixel coordinates.
                 Shape: [N, 2] or [B, N, 2], where N is the number of query points.
                 Default: None
+            attention_masks (torch.Tensor, optional): Boolean masks of shape [S, P], [B, S, P] or
+                [B * S, P] indicating occluded patch tokens (True = occluded). The tensor is reshaped
+                internally to match the batch and sequence dimensions.
 
         Returns:
             dict: A dictionary containing the following predictions:
@@ -58,7 +68,44 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        if attention_masks is not None:
+            B, S = images.shape[0], images.shape[1]
+            if attention_masks.dim() == 1:
+                raise ValueError("attention_masks must have at least two dimensions.")
+
+            if attention_masks.dim() == 2:
+                if attention_masks.shape[0] == S:
+                    attention_masks = attention_masks.unsqueeze(0)
+                elif attention_masks.shape[0] == B * S:
+                    attention_masks = attention_masks.view(B, S, -1)
+                else:
+                    raise ValueError(
+                        f"attention_masks with shape {attention_masks.shape} is incompatible with images of shape {images.shape}."
+                    )
+            elif attention_masks.dim() == 3:
+                if attention_masks.shape[0] == B and attention_masks.shape[1] == S:
+                    pass  # already in desired shape
+                elif B == 1 and attention_masks.shape[0] == S:
+                    attention_masks = attention_masks.unsqueeze(0)
+                elif attention_masks.shape[0] == B * S and attention_masks.shape[1] == 1:
+                    attention_masks = attention_masks.view(B, S, -1)
+                else:
+                    raise ValueError(
+                        f"attention_masks with shape {attention_masks.shape} is incompatible with images of shape {images.shape}."
+                    )
+            else:
+                raise ValueError(
+                    f"attention_masks with shape {attention_masks.shape} is incompatible with images of shape {images.shape}."
+                )
+
+            if attention_masks.shape[0] != B or attention_masks.shape[1] != S:
+                raise ValueError(
+                    f"attention_masks must align with batch and sequence dimensions ({B}, {S}); got {attention_masks.shape[:2]}."
+                )
+
+            attention_masks = attention_masks.to(device=images.device, dtype=torch.bool)
+
+        aggregated_tokens_list, patch_start_idx = self.aggregator(images, attention_masks=attention_masks)
 
         predictions = {}
 
@@ -94,4 +141,3 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             predictions["images"] = images  # store the images for visualization during inference
 
         return predictions
-

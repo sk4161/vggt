@@ -94,7 +94,7 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024):
     return images, original_coords
 
 
-def load_and_preprocess_images(image_path_list, mode="crop"):
+def load_and_preprocess_images(image_path_list, mode="crop", masks=None, return_masks=False):
     """
     A quick start function to load and preprocess images for model input.
     This assumes the images should have the same shape for easier batching, but our model can also work well with different shapes.
@@ -105,9 +105,13 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
                              - "crop" (default): Sets width to 518px and center crops height if needed.
                              - "pad": Preserves all pixels by making the largest dimension 518px
                                and padding the smaller dimension to reach a square shape.
+        masks (list, optional): Optional list of occlusion masks corresponding to each image.
+            Each mask can be a numpy array or PIL Image. Entries may be None.
+        return_masks (bool, optional): If True, also return the processed masks tensor.
 
     Returns:
-        torch.Tensor: Batched tensor of preprocessed images with shape (N, 3, H, W)
+        torch.Tensor or Tuple[torch.Tensor, torch.Tensor]: Images tensor of shape (N, 3, H, W).
+            When return_masks is True, also returns a masks tensor of shape (N, H, W) with dtype torch.uint8.
 
     Raises:
         ValueError: If the input list is empty or if mode is invalid
@@ -129,13 +133,17 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
     if mode not in ["crop", "pad"]:
         raise ValueError("Mode must be either 'crop' or 'pad'")
 
+    if masks is not None and len(masks) != len(image_path_list):
+        raise ValueError("Length of masks must match length of image_path_list.")
+
     images = []
+    masks_list = [] if return_masks else None
     shapes = set()
     to_tensor = TF.ToTensor()
     target_size = 518
 
     # First process all images and collect their shapes
-    for image_path in image_path_list:
+    for idx, image_path in enumerate(image_path_list):
         # Open image
         img = Image.open(image_path)
 
@@ -150,6 +158,19 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
         img = img.convert("RGB")
 
         width, height = img.size
+
+        mask_tensor = None
+        mask_img = None
+        if masks is not None:
+            mask_input = masks[idx]
+            if mask_input is not None:
+                if isinstance(mask_input, Image.Image):
+                    mask_img = mask_input.convert("L")
+                else:
+                    mask_arr = np.asarray(mask_input)
+                    if mask_arr.ndim == 3:
+                        mask_arr = mask_arr[..., 0]
+                    mask_img = Image.fromarray(mask_arr).convert("L")
 
         if mode == "pad":
             # Make the largest dimension 518px while maintaining aspect ratio
@@ -167,12 +188,17 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
 
         # Resize with new dimensions (width, height)
         img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
+        if mask_img is not None:
+            mask_resized = mask_img.resize((new_width, new_height), Image.Resampling.NEAREST)
+            mask_tensor = torch.from_numpy(np.array(mask_resized, dtype=np.uint8))
         img = to_tensor(img)  # Convert to tensor (0, 1)
 
         # Center crop height if it's larger than 518 (only in crop mode)
         if mode == "crop" and new_height > target_size:
             start_y = (new_height - target_size) // 2
             img = img[:, start_y : start_y + target_size, :]
+            if mask_tensor is not None:
+                mask_tensor = mask_tensor[start_y : start_y + target_size, :]
 
         # For pad mode, pad to make a square of target_size x target_size
         if mode == "pad":
@@ -189,9 +215,22 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
                 img = torch.nn.functional.pad(
                     img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
                 )
+                if mask_tensor is not None:
+                    mask_tensor = torch.nn.functional.pad(
+                        mask_tensor.unsqueeze(0),
+                        (pad_left, pad_right, pad_top, pad_bottom),
+                        mode="constant",
+                        value=0,
+                    ).squeeze(0)
 
         shapes.add((img.shape[1], img.shape[2]))
         images.append(img)
+        if return_masks:
+            if mask_tensor is None:
+                mask_tensor = torch.zeros((img.shape[1], img.shape[2]), dtype=torch.uint8)
+            else:
+                mask_tensor = (mask_tensor > 0).to(torch.uint8)
+            masks_list.append(mask_tensor)
 
     # Check if we have different shapes
     # In theory our model can also work well with different shapes
@@ -203,7 +242,8 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
 
         # Pad images if necessary
         padded_images = []
-        for img in images:
+        padded_masks = [] if return_masks else None
+        for idx, img in enumerate(images):
             h_padding = max_height - img.shape[1]
             w_padding = max_width - img.shape[2]
 
@@ -216,8 +256,24 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
                 img = torch.nn.functional.pad(
                     img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
                 )
+            if return_masks and masks_list is not None:
+                mask_tensor = masks_list[idx]
+                if h_padding > 0 or w_padding > 0:
+                    pad_top = h_padding // 2
+                    pad_bottom = h_padding - pad_top
+                    pad_left = w_padding // 2
+                    pad_right = w_padding - pad_left
+                    mask_tensor = torch.nn.functional.pad(
+                        mask_tensor.unsqueeze(0),
+                        (pad_left, pad_right, pad_top, pad_bottom),
+                        mode="constant",
+                        value=0,
+                    ).squeeze(0)
+                padded_masks.append(mask_tensor)
             padded_images.append(img)
         images = padded_images
+        if return_masks and masks_list is not None:
+            masks_list = padded_masks
 
     images = torch.stack(images)  # concatenate images
 
@@ -227,4 +283,8 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
         if images.dim() == 3:
             images = images.unsqueeze(0)
 
-    return images
+    if not return_masks:
+        return images
+
+    masks_tensor = torch.stack(masks_list) if masks_list is not None else None
+    return images, masks_tensor

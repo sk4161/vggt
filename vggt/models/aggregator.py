@@ -181,11 +181,19 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
-    def forward(self, images: torch.Tensor) -> Tuple[List[torch.Tensor], int]:
+    def forward(
+        self,
+        images: torch.Tensor,
+        attention_masks: Optional[torch.Tensor] = None,
+    ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            attention_masks (torch.Tensor, optional): Boolean masks indicating which patch tokens should
+                be treated as occluded. Shape [B, S, P] where P = (H / patch_size) * (W / patch_size).
+                True values mark occluded patches that will be replaced by the learned mask token when
+                supported, or zeroed out otherwise.
 
         Returns:
             (list[torch.Tensor], int):
@@ -202,7 +210,34 @@ class Aggregator(nn.Module):
 
         # Reshape to [B*S, C, H, W] for patch embedding
         images = images.view(B * S, C_in, H, W)
-        patch_tokens = self.patch_embed(images)
+        patch_masks_flat: Optional[torch.Tensor] = None
+        if attention_masks is not None:
+            if attention_masks.dim() == 2:
+                if B != 1:
+                    raise ValueError(
+                        f"Expected attention_masks with batch dimension {B}, got shape {attention_masks.shape}"
+                    )
+                attention_masks = attention_masks.unsqueeze(0)
+            if attention_masks.dim() != 3 or attention_masks.shape[0] != B or attention_masks.shape[1] != S:
+                raise ValueError(
+                    "attention_masks must have shape [B, S, P] or [S, P] matching the input images."
+                )
+            patch_masks_flat = attention_masks.reshape(B * S, -1).to(device=images.device)
+            patch_masks_flat = patch_masks_flat.to(dtype=torch.bool)
+            expected_patches = (H // self.patch_size) * (W // self.patch_size)
+            if patch_masks_flat.shape[1] != expected_patches:
+                raise ValueError(
+                    f"attention_masks length {patch_masks_flat.shape[1]} does not match expected patch count {expected_patches}."
+                )
+
+        supports_mask = hasattr(self.patch_embed, "forward_features")
+        if patch_masks_flat is not None and supports_mask:
+            patch_tokens = self.patch_embed(images, masks=patch_masks_flat)
+        else:
+            patch_tokens = self.patch_embed(images)
+            if patch_masks_flat is not None:
+                # For patch embed modules without native masking support, zero-out occluded tokens.
+                patch_tokens = patch_tokens.masked_fill(patch_masks_flat.unsqueeze(-1), 0.0)
 
         if isinstance(patch_tokens, dict):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
