@@ -117,7 +117,7 @@ def load_and_preprocess_images(image_path_list, mode="crop", masks=None, return_
         ValueError: If the input list is empty or if mode is invalid
 
     Notes:
-        - Images with different dimensions will be padded with white (value=1.0)
+        - Images with different dimensions will be padded with black (value=0.0)
         - A warning is printed when images have different shapes
         - When mode="crop": The function ensures width=518px while maintaining aspect ratio
           and height is center-cropped if larger than 518px
@@ -211,9 +211,9 @@ def load_and_preprocess_images(image_path_list, mode="crop", masks=None, return_
                 pad_left = w_padding // 2
                 pad_right = w_padding - pad_left
 
-                # Pad with white (value=1.0)
+                # Pad with black (value=0.0)
                 img = torch.nn.functional.pad(
-                    img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
+                    img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=0.0
                 )
                 if mask_tensor is not None:
                     mask_tensor = torch.nn.functional.pad(
@@ -254,7 +254,7 @@ def load_and_preprocess_images(image_path_list, mode="crop", masks=None, return_
                 pad_right = w_padding - pad_left
 
                 img = torch.nn.functional.pad(
-                    img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
+                    img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=0.0
                 )
             if return_masks and masks_list is not None:
                 mask_tensor = masks_list[idx]
