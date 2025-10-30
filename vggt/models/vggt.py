@@ -26,7 +26,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1") if enable_depth else None
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_track else None
 
-    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
+    def forward(self, images: torch.Tensor, query_points: torch.Tensor = None, attention_masks: torch.Tensor = None):
         """
         Forward pass of the VGGT model.
 
@@ -36,6 +36,9 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             query_points (torch.Tensor, optional): Query points for tracking, in pixel coordinates.
                 Shape: [N, 2] or [B, N, 2], where N is the number of query points.
                 Default: None
+            attention_masks (torch.Tensor, optional): Attention masks with shape [S, 1, H, W] or [B, S, 1, H, W].
+                Masks indicate which regions should be masked in attention computation.
+                1.0 = visible, 0.0 = masked. Default: None
 
         Returns:
             dict: A dictionary containing the following predictions:
@@ -54,11 +57,13 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         # If without batch dimension, add it
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
+            if attention_masks is not None and len(attention_masks.shape) == 1:
+                attention_masks = attention_masks.unsqueeze(0)
             
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        aggregated_tokens_list, patch_start_idx = self.aggregator(images, attention_masks=attention_masks)
 
         predictions = {}
 

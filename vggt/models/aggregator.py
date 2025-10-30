@@ -181,11 +181,14 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
-    def forward(self, images: torch.Tensor) -> Tuple[List[torch.Tensor], int]:
+    def forward(self, images: torch.Tensor, attention_masks: torch.Tensor = None) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            attention_masks (torch.Tensor, optional): Attention masks with shape [B, S, 1, H, W].
+                Masks indicate which regions should be masked in attention computation.
+                1.0 = visible, 0.0 = masked. Default: None
 
         Returns:
             (list[torch.Tensor], int):
@@ -208,6 +211,24 @@ class Aggregator(nn.Module):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
         _, P, C = patch_tokens.shape
+
+        # Process attention masks if provided
+        patch_attention_mask = None
+        if attention_masks is not None:
+            # attention_masks is already at patch level: [B*S, num_patches]
+            # Check if it includes special tokens or not
+            patch_h, patch_w = H // self.patch_size, W // self.patch_size
+            expected_patch_tokens = patch_h * patch_w
+            
+            if attention_masks.shape[1] == expected_patch_tokens:
+                # Only patch tokens, need to add special tokens (always visible = False)
+                special_tokens_mask = torch.zeros(B * S, self.patch_start_idx, dtype=torch.bool, device=attention_masks.device)
+                patch_attention_mask = torch.cat([special_tokens_mask, attention_masks], dim=1)
+            elif attention_masks.shape[1] == expected_patch_tokens + self.patch_start_idx:
+                # Already includes special tokens
+                patch_attention_mask = attention_masks
+            else:
+                raise ValueError(f"Unexpected attention_masks shape: {attention_masks.shape}, expected patch tokens: {expected_patch_tokens}, patch_start_idx: {self.patch_start_idx}")
 
         # Expand camera and register tokens to match batch size and sequence length
         camera_token = slice_expand_and_flatten(self.camera_token, B, S)
@@ -238,11 +259,11 @@ class Aggregator(nn.Module):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
-                        tokens, B, S, P, C, frame_idx, pos=pos
+                        tokens, B, S, P, C, frame_idx, pos=pos, attention_mask=patch_attention_mask
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
+                        tokens, B, S, P, C, global_idx, pos=pos, attention_mask=patch_attention_mask
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -257,7 +278,7 @@ class Aggregator(nn.Module):
         del global_intermediates
         return output_list, self.patch_start_idx
 
-    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
+    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None, attention_mask=None):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
         """
@@ -273,15 +294,15 @@ class Aggregator(nn.Module):
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             if self.training:
-                tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, attention_mask, use_reentrant=self.use_reentrant)
             else:
-                tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
+                tokens = self.frame_blocks[frame_idx](tokens, pos=pos, attention_mask=attention_mask)
             frame_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, attention_mask=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
@@ -290,15 +311,21 @@ class Aggregator(nn.Module):
 
         if pos is not None and pos.shape != (B, S * P, 2):
             pos = pos.view(B, S, P, 2).view(B, S * P, 2)
+            
+        # Reshape attention mask for global attention
+        global_attention_mask = None
+        if attention_mask is not None:
+            # Reshape from (B*S, P) to (B, S*P)
+            global_attention_mask = attention_mask.view(B, S * P)
 
         intermediates = []
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             if self.training:
-                tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, global_attention_mask, use_reentrant=self.use_reentrant)
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos)
+                tokens = self.global_blocks[global_idx](tokens, pos=pos, attention_mask=global_attention_mask)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
